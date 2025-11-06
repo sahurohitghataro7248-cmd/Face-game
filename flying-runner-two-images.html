@@ -1,0 +1,372 @@
+<!doctype html>
+<html lang="hi">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Flying Runner — Face Fly + 2 Uploads</title>
+<style>
+  :root{--bg:#87ceeb;--ground:#4b8b3b}
+  html,body{height:100%;margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;background:linear-gradient(#dff6ff,#bfe9ff)}
+  .wrap{display:flex;flex-direction:column;align-items:center;gap:12px;padding:12px;min-height:100vh}
+  #gameCanvas{width:100%;max-width:1000px;height:60vh;border-radius:12px;box-shadow:0 8px 22px rgba(0,0,0,0.14);background:#7ec0e6;display:block}
+  .controls{width:100%;max-width:1000px;display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap}
+  .btn{padding:8px 12px;border-radius:8px;background:#fff;border:1px solid #ddd;cursor:pointer}
+  input[type=file]{display:none}
+  .note{max-width:1000px;color:#333;font-size:13px;text-align:center}
+  /* small overlay to prevent black screen */
+  #overlay{position:fixed;left:0;top:0;right:0;bottom:0;background:linear-gradient(rgba(0,0,0,0.55),rgba(0,0,0,0.4));display:flex;align-items:center;justify-content:center;z-index:9998}
+  #overlay .card{background:linear-gradient(#fff,#f3fbff);padding:18px;border-radius:12px;text-align:center;max-width:92%;box-shadow:0 12px 30px rgba(0,0,0,0.25)}
+  /* loss popup */
+  #lossPopup{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);z-index:10000;background:#fff;border-radius:12px;box-shadow:0 20px 50px rgba(0,0,0,0.3);max-width:92%;width:380px;padding:14px;display:none}
+  #lossPopup img{width:200px;height:auto;object-fit:contain;display:block;margin:8px auto;border-radius:8px}
+  #lossPopup h3{margin:8px 0 6px 0;text-align:center}
+  #lossPopup .popup-row{display:flex;gap:8px;justify-content:center;margin-top:8px}
+  @media(max-width:420px){ #lossPopup{width:92%} #lossPopup img{width:160px} }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="controls">
+    <div style="min-width:200px">
+      <strong>Flying Runner — Face Fly</strong>
+      <div style="font-size:13px;color:#333">Upload face (character) and separate popup image for Game Over. Tap to start.</div>
+    </div>
+
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+      <label class="btn">Upload Face<input id="imgFace" type="file" accept="image/*"></label>
+      <label class="btn">Upload Popup Image<input id="imgPopup" type="file" accept="image/*"></label>
+      <button id="startBtn" class="btn">Start / Restart</button>
+      <button id="resetBtn" class="btn">Reset High</button>
+    </div>
+  </div>
+
+  <canvas id="gameCanvas"></canvas>
+
+  <div style="display:flex;gap:8px;max-width:1000px;margin-top:6px">
+    <div class="btn">Score: <span id="score">0</span></div>
+    <div class="btn">High: <span id="high">0</span></div>
+  </div>
+
+  <div class="note">Use only images you have rights for. If sound blocked, tap screen once to enable.</div>
+</div>
+
+<!-- overlay to initialize audio / prevent black screen -->
+<div id="overlay" aria-hidden="false">
+  <div class="card">
+    <h2 style="margin:0 0 8px 0">Ready to play?</h2>
+    <p style="margin:0 0 12px 0;color:#333">Tap anywhere to initialise sound & canvas.</p>
+    <button id="overlayStart" class="btn">Tap to Start</button>
+  </div>
+</div>
+
+<!-- Loss popup -->
+<div id="lossPopup" role="dialog" aria-modal="true">
+  <h3>Game Over</h3>
+  <img id="popupImage" src="" alt="Popup image (your upload)">
+  <div style="text-align:center;color:#333" id="popupScore">Score: 0</div>
+  <div class="popup-row">
+    <button id="retryBtn" class="btn">Retry</button>
+    <button id="closeBtn" class="btn">Close</button>
+  </div>
+</div>
+
+<script>
+(() => {
+  // Elements
+  const canvas = document.getElementById('gameCanvas');
+  const ctx = canvas.getContext('2d');
+  const overlay = document.getElementById('overlay');
+  const overlayStart = document.getElementById('overlayStart');
+  const imgFace = document.getElementById('imgFace');
+  const imgPopup = document.getElementById('imgPopup');
+  const startBtn = document.getElementById('startBtn');
+  const resetBtn = document.getElementById('resetBtn');
+  const scoreEl = document.getElementById('score');
+  const highEl = document.getElementById('high');
+
+  const lossPopup = document.getElementById('lossPopup');
+  const popupImage = document.getElementById('popupImage');
+  const popupScore = document.getElementById('popupScore');
+  const retryBtn = document.getElementById('retryBtn');
+  const closeBtn = document.getElementById('closeBtn');
+
+  // Audio context
+  let audioCtx = null;
+  function ensureAudioContext(){ if(!audioCtx){ try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch(e){ audioCtx = null; } } return audioCtx; }
+  function resumeAudio(){ const ac = ensureAudioContext(); if(ac && ac.state === 'suspended') ac.resume().catch(()=>{}); }
+
+  // Canvas sizing
+  function resizeCanvas(){
+    const rect = canvas.getBoundingClientRect();
+    canvas.width = Math.max(600, Math.min(1400, (rect.width * (devicePixelRatio || 1))));
+    canvas.height = Math.max(360, Math.min(900, (rect.height * (devicePixelRatio || 1))));
+  }
+  window.addEventListener('resize', () => { resizeCanvas(); render(); });
+  canvas.style.width = '100%'; canvas.style.height = '60vh';
+  resizeCanvas();
+
+  // Game state (gravity enabled)
+  let running = false;
+  let lastTime = performance.now();
+  let score = 0;
+  let high = Number(localStorage.getItem('fr_twoimg_high') || 0);
+  highEl.textContent = high;
+
+  // Player (head image)
+  const player = { x:140, y:200, w:120, h:120, vy:0, gravity:1.0, lift:-14, rotation:0 };
+  // You can increase player.w/player.h to make face bigger (e.g., 160)
+
+  const obstacles = [];
+  let spawnTimer = 0;
+  const spawnGap = 1400;
+
+  // Uploaded images
+  let faceImg = null;       // displayed as player
+  let popupImgData = '';    // data URL for popup
+
+  // Load face image (object URL -> Image)
+  imgFace.addEventListener('change', (e) => {
+    const f = e.target.files && e.target.files[0];
+    if(!f) return;
+    const url = URL.createObjectURL(f);
+    const img = new Image();
+    img.onload = () => {
+      faceImg = img;
+      URL.revokeObjectURL(url);
+      // immediate redraw so player sees upload
+      render();
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); alert('Face image load failed'); };
+    img.src = url;
+  });
+
+  // Load popup image (store as data URL to show in popup)
+  imgPopup.addEventListener('change', (e) => {
+    const f = e.target.files && e.target.files[0];
+    if(!f) return;
+    const url = URL.createObjectURL(f);
+    const img = new Image();
+    img.onload = () => {
+      // create data URL copy sized reasonably
+      try {
+        const tmp = document.createElement('canvas');
+        const max = 800;
+        let iw = img.width, ih = img.height;
+        const scale = Math.min(1, max / Math.max(iw, ih));
+        tmp.width = Math.round(iw * scale);
+        tmp.height = Math.round(ih * scale);
+        const tctx = tmp.getContext('2d');
+        tctx.drawImage(img, 0, 0, tmp.width, tmp.height);
+        popupImgData = tmp.toDataURL('image/png');
+      } catch (err) {
+        popupImgData = url; // fallback
+      }
+      URL.revokeObjectURL(url);
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); alert('Popup image load failed'); };
+    img.src = url;
+  });
+
+  // Simple SFX
+  function playTone(freq, time=0.08, type='sine', vol=0.12){
+    const ac = ensureAudioContext();
+    if(!ac) return;
+    try {
+      const o = ac.createOscillator();
+      const g = ac.createGain();
+      o.type = type; o.frequency.value = freq;
+      g.gain.value = vol; o.connect(g); g.connect(ac.destination);
+      o.start(); g.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + time);
+      setTimeout(()=>{ try{ o.stop(); }catch(e){} }, time*1100);
+    } catch(e){}
+  }
+  function sfxJump(){ playTone(880,0.12,'triangle',0.08); }
+  function sfxHit(){ playTone(140,0.22,'sawtooth',0.18); }
+  function sfxScore(){ playTone(1300,0.05,'sine',0.06); }
+
+  // Controls: boost/jump
+  function boost(){
+    if(!running) return;
+    player.vy = player.lift;
+    sfxJump();
+  }
+  window.addEventListener('keydown', (e) => { if(e.code === 'Space' || e.code === 'ArrowUp'){ e.preventDefault(); boost(); }});
+  canvas.addEventListener('pointerdown', (e) => { resumeAudio(); boost(); });
+
+  // Start/reset
+  startBtn.addEventListener('click', startGame);
+  resetBtn.addEventListener('click', () => { localStorage.removeItem('fr_twoimg_high'); high = 0; highEl.textContent = high; });
+
+  // Obstacles
+  function createObstacle(){
+    const h = canvas.height;
+    const gap = Math.max(100, 220 - Math.min(120, Math.floor(score/6)));
+    const top = Math.random() * (h*0.4);
+    const obH = Math.max(40, Math.random() * (h*0.18) + 40);
+    const bottomY = top + obH + gap;
+    const w = 44 + Math.random()*36;
+    const speed = 4 + Math.min(6, score * 0.12);
+    obstacles.push({ x: canvas.width + 80, y: 0, w: w, h: top, speed: speed, passed:false });
+    obstacles.push({ x: canvas.width + 80, y: bottomY, w: w, h: h - bottomY, speed: speed, passed:false });
+  }
+
+  function rectIntersect(ax,ay,aw,ah,bx,by,bw,bh){
+    return !(bx > ax + aw || bx + bw < ax || by > ay + ah || by + bh < ay);
+  }
+
+  // Game start/end
+  function startGame(){
+    running = true;
+    score = 0; scoreEl.textContent = score;
+    player.y = canvas.height/2;
+    player.vy = 0;
+    obstacles.length = 0;
+    spawnTimer = 0;
+    lastTime = performance.now();
+    hidePopup();
+  }
+
+  function endGame(){
+    running = false;
+    sfxHit();
+    if(score > high){ high = score; localStorage.setItem('fr_twoimg_high', high); highEl.textContent = high; }
+    showPopup();
+  }
+
+  // Popup
+  function showPopup(){
+    popupImage.src = popupImgData || '';
+    popupScore.textContent = 'Score: ' + score;
+    lossPopup.style.display = 'block';
+  }
+  function hidePopup(){ lossPopup.style.display = 'none'; }
+  retryBtn.addEventListener('click', ()=> { hidePopup(); startGame(); });
+  closeBtn.addEventListener('click', ()=> { hidePopup(); });
+
+  // Update & render
+  let frame = 0;
+  function update(dt){
+    if(!running) return;
+    // physics
+    player.vy += player.gravity * (dt/16);
+    // cap falling speed
+    if(player.vy > 20) player.vy = 20;
+    player.y += player.vy * (dt/16);
+    // rotation
+    player.rotation = Math.max(-0.6, Math.min(0.8, player.vy * -0.03));
+
+    const floorY = canvas.height * 0.88;
+    if(player.y + player.h*0.5 > floorY){ player.y = floorY - player.h*0.5; player.vy = 0; endGame(); }
+    if(player.y - player.h*0.5 < 0){ player.y = player.h*0.5; player.vy = 0; }
+
+    spawnTimer += dt;
+    if(spawnTimer > spawnGap){ spawnTimer = 0; createObstacle(); }
+
+    for(let i = obstacles.length-1; i>=0; i--){
+      const ob = obstacles[i];
+      ob.x -= ob.speed * (dt/16);
+      // collision
+      const px = player.x - player.w*0.5;
+      const py = player.y - player.h*0.5;
+      if(rectIntersect(px,py,player.w,player.h, ob.x, ob.y, ob.w, ob.h)){
+        endGame();
+      }
+      if(ob.x + ob.w < -50) obstacles.splice(i,1);
+      else if(!ob.passed && ob.x + ob.w < player.x - player.w*0.5){
+        ob.passed = true; score += 1; scoreEl.textContent = score; sfxScore();
+      }
+    }
+  }
+
+  function render(){
+    const cw = canvas.width, ch = canvas.height;
+    ctx.clearRect(0,0,cw,ch);
+    // background
+    const g = ctx.createLinearGradient(0,0,0,ch);
+    g.addColorStop(0, '#aee7ff'); g.addColorStop(1, '#7ec0e6');
+    ctx.fillStyle = g; ctx.fillRect(0,0,cw,ch);
+
+    // obstacles
+    ctx.fillStyle = '#6b3e26';
+    for(const ob of obstacles) ctx.fillRect(Math.round(ob.x), Math.round(ob.y), ob.w, ob.h);
+
+    // ground
+    const groundY = ch * 0.88;
+    ctx.fillStyle = '#4b8b3b';
+    ctx.fillRect(0, groundY, cw, ch - groundY);
+
+    // draw player: FULL image rectangle (no circle clipping), centered at player.x/player.y
+    ctx.save();
+    ctx.translate(player.x, player.y);
+    ctx.rotate(player.rotation);
+
+    const dw = player.w, dh = player.h;
+    if(faceImg){
+      // draw covering rectangle preserving aspect ratio (cover)
+      const iw = faceImg.width, ih = faceImg.height;
+      const scale = Math.max(dw/iw, dh/ih);
+      const sw = iw, sh = ih;
+      const dx = -dw/2, dy = -dh/2;
+      ctx.drawImage(faceImg, 0, 0, sw, sh, dx, dy, dw, dh);
+      // no border/line
+    } else {
+      // placeholder rectangle face (no border)
+      ctx.fillStyle = '#ffd8b3';
+      ctx.fillRect(-dw/2, -dh/2, dw, dh);
+      ctx.fillStyle = '#222';
+      ctx.fillRect(-dw*0.12, -dh*0.12, dw*0.06, dh*0.06);
+      ctx.fillRect(dw*0.06, -dh*0.12, dw*0.06, dh*0.06);
+      ctx.beginPath(); ctx.arc(0, dh*0.08, dw*0.12, 0, Math.PI); ctx.lineWidth = 3; ctx.strokeStyle = '#994400'; ctx.stroke();
+    }
+    ctx.restore();
+
+    // HUD
+    ctx.fillStyle = '#fff'; ctx.font = `${18*(cw/900)}px system-ui`; ctx.fillText(`Score: ${score}`, 14*(cw/900), 28*(ch/500));
+
+    // if not running, show instruction overlay within canvas
+    if(!running){
+      ctx.fillStyle = 'rgba(0,0,0,0.45)';
+      ctx.fillRect(cw*0.12, ch*0.28, cw*0.76, ch*0.18);
+      ctx.fillStyle = '#fff';
+      ctx.font = `${22*(cw/900)}px system-ui`;
+      ctx.fillText('Tap to Boost / Press Space. Upload face & popup image.', cw*0.16, ch*0.34);
+      ctx.fillText('Click Start to begin.', cw*0.16, ch*0.42);
+    }
+
+    frame++;
+  }
+
+  // main loop
+  function loop(now){
+    const dt = Math.min(40, now - lastTime);
+    lastTime = now;
+    update(dt);
+    render();
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame((t)=>{ lastTime = t; loop(t); });
+
+  // overlay start behavior
+  function onOverlayStart(){
+    resumeAudio();
+    overlay.style.display = 'none';
+    // do not auto-start; user should press Start or tap canvas to begin playing
+  }
+  overlayStart.addEventListener('click', onOverlayStart);
+  overlay.addEventListener('pointerdown', onOverlayStart);
+
+  // initial draw to avoid black
+  function initialDraw(){
+    ctx.fillStyle = '#7ec0e6'; ctx.fillRect(0,0,canvas.width,canvas.height);
+    ctx.fillStyle = '#fff'; ctx.font = `${20*(canvas.width/900)}px system-ui`; ctx.textAlign='center';
+    ctx.fillText('Preparing game... Tap to start', canvas.width/2, canvas.height/2);
+  }
+  initialDraw();
+
+  // popup button hooks already set above
+  // show popup image when game ends - handled in showPopup()
+
+})();
+</script>
+</body>
+</html>
